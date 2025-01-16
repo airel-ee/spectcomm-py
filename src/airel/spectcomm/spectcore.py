@@ -234,9 +234,13 @@ class SpectCoreRemote:
             raise SpectCoreRemoteError("Response error '{0}'".format(res["error"]))
         return res
 
-    def request_control(self):
+    def request_control(self, priority=None):
         msgid = self.next_msg_id()
-        msg = {"method": "request_control", "id": msgid, "params": {}}
+        if priority is None:
+            params = {}
+        else:
+            params = {"priority": priority}
+        msg = {"method": "request_control", "id": msgid, "params": params}
         self.send_message(msg)
         res = self.receive_id_response(msgid)
         if "error" in res:
