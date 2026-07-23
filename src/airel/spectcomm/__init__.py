@@ -5,3 +5,5 @@ from .spectcore import (
     SpectCoreRemoteError,
 )
 from .serial_connection import connect_serial_port
+from . import airdaq
+from .airdaq import AirdaqRemote, AirdaqError
