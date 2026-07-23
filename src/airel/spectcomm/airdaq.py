@@ -6,11 +6,13 @@ endpoints (COBS framing).  Outbound message maps are built with "t" as
 the first key -- a protocol encoder obligation.
 """
 
-import collections
 import getpass
 import ipaddress
+import itertools
+import queue
 import random
 import socket
+import threading
 import time
 
 import cbor2
@@ -392,14 +394,20 @@ def _usable_field(f):
     return True
 
 
+_SESSION_FAILED = object()
+
+
 class AirdaqRemote:
     """An airdaq session over a stream or USB connection.
 
-    Maintains the protocol's stateful caches (state, settings, channels,
-    commands, control) and decodes record pushes to field-keyed values.
+    A background reader thread drains the connection: it keeps the caches
+    (state, settings, channels, commands, control) current, sends the
+    idle_timeout keepalive on schedule, routes responses to waiting
+    requests, and queues everything else -- stamped with the receive wall
+    clock -- for next_message().  Requests may be issued from any thread.
     """
 
-    def __init__(self, conn, client_name=None, wait_ready=True):
+    def __init__(self, conn, client_name=None, wait_ready=True, queue_size=10000):
         self.conn = conn
 
         self.state = {}
@@ -412,13 +420,17 @@ class AirdaqRemote:
         self.record_meta = {}
         self.subscriptions = set()
         self.ready = False
-        self.last_beacon = None
-        self.message_queue = collections.deque()
-        self.id_counter = 0
+        self._queue = queue.Queue(maxsize=queue_size)
+        self._ids = itertools.count(1)
         self._field_ids = {}
-        self._anchor = None
-        self._auto_ping_ids = set()
-        self._last_send = time.monotonic()
+        self._ping_ids = set()
+        self._pending = {}
+        self._error = None
+        self._closing = False
+        self._cond = threading.Condition()
+        self._send_lock = threading.Lock()
+        self._control_gen = 0
+        self._reader = None
 
         if client_name is None:
             try:
@@ -457,9 +469,19 @@ class AirdaqRemote:
         self.model = self.hello.get("model")
         self.hw_version = self.hello.get("hw_version")
         self.fw_version = self.hello.get("fw_version")
+        self._last_send = time.monotonic()
+
+        self._reader = threading.Thread(
+            target=self._reader_loop, name="airdaq-reader", daemon=True
+        )
+        self._reader.start()
 
         if wait_ready:
-            self.wait_ready()
+            try:
+                self.wait_ready()
+            except BaseException:
+                self.close()
+                raise
 
     def __enter__(self):
         return self
@@ -468,77 +490,105 @@ class AirdaqRemote:
         self.close()
 
     def close(self):
-        self.conn.close()
+        self._closing = True
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        if self._reader is not None and self._reader.is_alive():
+            self._reader.join(timeout=5)
 
     def wait_ready(self, timeout=10):
-        deadline = time.monotonic() + timeout
-        while not self.ready:
-            msg = self.receive_message(deadline - time.monotonic())
-            if msg is None:
-                raise AirdaqError("timeout waiting for ready")
+        with self._cond:
+            self._cond.wait_for(
+                lambda: self.ready or self._error is not None, timeout
+            )
+            if self.ready:
+                return
+            if self._error is not None:
+                raise self._error
+            raise AirdaqError("timeout waiting for ready")
 
     def ping(self, timeout=60):
         """Return the server clock in ns on the ts axis."""
-        return self._request({"t": "ping", "id": self._next_id()}, timeout)
+        return self._request({"t": "ping", "id": next(self._ids)}, timeout)
 
     def set(self, key, value, timeout=60):
         return self._request(
-            {"t": "set", "id": self._next_id(), "key": key, "value": value}, timeout
+            {"t": "set", "id": next(self._ids), "key": key, "value": value}, timeout
         )
 
     def unset(self, key, timeout=60):
         """Revert a setting to its device default."""
-        return self._request({"t": "unset", "id": self._next_id(), "key": key}, timeout)
+        return self._request({"t": "unset", "id": next(self._ids), "key": key}, timeout)
 
     def subscribe(self, channels, timeout=60):
         """Replace the active subscription set; [] stops all channel traffic."""
         channels = list(channels)
         self._request(
-            {"t": "subscribe", "id": self._next_id(), "channels": channels}, timeout
+            {"t": "subscribe", "id": next(self._ids), "channels": channels}, timeout
         )
         self.subscriptions = set(channels)
 
     def command(self, key, params=None, timeout=60):
-        msg = {"t": "command", "id": self._next_id(), "key": key}
+        msg = {"t": "command", "id": next(self._ids), "key": key}
         if params is not None:
             msg["params"] = params
         return self._request(msg, timeout)
 
     def authenticate(self, password, timeout=60):
         return self._request(
-            {"t": "authenticate", "id": self._next_id(), "password": password}, timeout
+            {"t": "authenticate", "id": next(self._ids), "password": password}, timeout
         )
 
     def request_control(self, priority=0, timeout=60):
         """Queue a control request; return has_control from the control push
         that follows every request_control."""
+        with self._cond:
+            gen = self._control_gen
         self._request(
-            {"t": "request_control", "id": self._next_id(), "priority": priority},
+            {"t": "request_control", "id": next(self._ids), "priority": priority},
             timeout,
         )
-        deadline = time.monotonic() + timeout
-        while True:
-            msg = self.receive_message(deadline - time.monotonic())
-            if msg is None:
-                raise AirdaqError("no control push after request_control")
-            if msg.get("t") == "control":
-                return msg["has_control"]
-            self.message_queue.append(msg)
+        with self._cond:
+            self._cond.wait_for(
+                lambda: self._control_gen > gen or self._error is not None, timeout
+            )
+            if self._control_gen <= gen:
+                raise self._error or AirdaqError(
+                    "no control push after request_control"
+                )
+        return self.control["has_control"]
 
     def drop_control(self, timeout=60):
-        return self._request({"t": "drop_control", "id": self._next_id()}, timeout)
+        return self._request({"t": "drop_control", "id": next(self._ids)}, timeout)
 
     def next_message(self, timeout=60):
-        """Return the next queued or received message, or None on timeout."""
-        if self.message_queue:
-            return self.message_queue.popleft()
-        return self.receive_message(timeout)
+        """Return the next queued message, or None on timeout.
+
+        Every queued message carries rx_unix_ns, the client wall clock at
+        receipt.  The queue carries records (decoded), beacons, events,
+        logs, record_meta, and cache pushes (after their side effects are
+        applied); responses never appear.
+        """
+        try:
+            msg = self._queue.get(timeout=timeout)
+        except queue.Empty:
+            if self._error is not None:
+                raise self._error
+            return None
+        if msg is _SESSION_FAILED:
+            try:
+                self._queue.put_nowait(_SESSION_FAILED)
+            except queue.Full:
+                pass
+            raise self._error
+        return msg
 
     def records(self, channel=None, timeout=60):
-        """Yield decoded record pushes.
+        """Yield decoded record pushes, discarding other queued messages.
 
-        Other traffic still updates the caches but is not queued, so this
-        can run indefinitely.
+        Use a next_message() loop instead when events or logs matter.
         """
         while True:
             msg = self.next_message(timeout)
@@ -547,39 +597,50 @@ class AirdaqRemote:
             if msg.get("t") == "record" and channel in (None, msg.get("channel")):
                 yield msg
 
-    def receive_message(self, timeout=60):
-        """Read one message, apply its cache/record processing, return it."""
-        deadline = time.monotonic() + timeout
-        while True:
-            self._maybe_ping()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            if self.idle_timeout is not None:
-                remaining = min(remaining, self.idle_timeout / 4)
-            msg = self.conn.receive_message(remaining)
-            if msg is None:
-                continue
-            if msg.get("t") in ("ok", "err") and msg.get("id") in self._auto_ping_ids:
-                self._auto_ping_ids.discard(msg["id"])
-                continue
-            return self._process(msg)
-
-    def unix_ns(self, ts):
-        """Map a device timestamp to Unix ns via the last anchored beacon;
-        None before one has arrived."""
-        if self._anchor is None:
-            return None
-        beacon_ts, beacon_unix = self._anchor
-        return ts - beacon_ts + beacon_unix
-
-    def _next_id(self):
-        self.id_counter += 1
-        return self.id_counter
-
     def _send(self, message):
-        self.conn.send_message(message)
-        self._last_send = time.monotonic()
+        with self._send_lock:
+            self.conn.send_message(message)
+            self._last_send = time.monotonic()
+
+    def _request(self, msg, timeout=60):
+        if self._error is not None:
+            raise self._error
+        event = threading.Event()
+        slot = {}
+        self._pending[msg["id"]] = (event, slot)
+        try:
+            self._send(msg)
+            if not event.wait(timeout):
+                raise AirdaqError("timeout waiting for response")
+        finally:
+            self._pending.pop(msg["id"], None)
+        m = slot["msg"]
+        if isinstance(m, AirdaqError):
+            raise m
+        if m["t"] == "err":
+            e = m.get("error", {})
+            raise AirdaqError(
+                "{}: {}".format(e.get("code"), e.get("message")), code=e.get("code")
+            )
+        return m.get("result")
+
+    def _reader_loop(self):
+        try:
+            while True:
+                self._maybe_ping()
+                tick = (
+                    1.0
+                    if self.idle_timeout is None
+                    else min(1.0, self.idle_timeout / 4)
+                )
+                msg = self.conn.receive_message(tick)
+                if msg is not None:
+                    self._handle(msg)
+        except (AirdaqError, OSError) as e:
+            if not self._closing:
+                if not isinstance(e, AirdaqError):
+                    e = AirdaqError("connection lost: {}".format(e))
+                self._fail(e)
 
     def _maybe_ping(self):
         # Client silence past idle_timeout invalidates the session (USB,
@@ -588,34 +649,55 @@ class AirdaqRemote:
             self.idle_timeout is not None
             and time.monotonic() - self._last_send > self.idle_timeout / 2
         ):
-            msgid = self._next_id()
-            self._auto_ping_ids.add(msgid)
+            msgid = next(self._ids)
+            self._ping_ids.add(msgid)
             self._send({"t": "ping", "id": msgid})
 
-    def _request(self, msg, timeout=60):
-        msgid = msg["id"]
-        self._send(msg)
-        deadline = time.monotonic() + timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise AirdaqError("timeout waiting for response")
-            m = self.conn.receive_message(remaining)
-            if m is None:
-                continue
-            t = m.get("t")
-            if t in ("ok", "err") and m.get("id") == msgid:
-                if t == "err":
-                    e = m.get("error", {})
-                    raise AirdaqError(
-                        "{}: {}".format(e.get("code"), e.get("message")),
-                        code=e.get("code"),
-                    )
-                return m.get("result")
-            if t in ("ok", "err") and m.get("id") in self._auto_ping_ids:
-                self._auto_ping_ids.discard(m["id"])
-                continue
-            self.message_queue.append(self._process(m))
+    def _handle(self, msg):
+        t = msg.get("t")
+        if t in ("ok", "err"):
+            msgid = msg.get("id")
+            if msgid in self._ping_ids:
+                self._ping_ids.discard(msgid)
+                return
+            entry = self._pending.get(msgid)
+            if entry is not None:
+                event, slot = entry
+                slot["msg"] = msg
+                event.set()
+                return
+        msg["rx_unix_ns"] = time.time_ns()
+        msg = self._process(msg)
+        if t == "ready":
+            with self._cond:
+                self._cond.notify_all()
+            return
+        if t == "control":
+            with self._cond:
+                self._control_gen += 1
+                self._cond.notify_all()
+        if not self.ready:
+            return  # initial sync lives in the caches, not the queue
+        try:
+            self._queue.put_nowait(msg)
+        except queue.Full:
+            raise AirdaqError("message queue full -- consumer too slow")
+
+    def _fail(self, exc):
+        with self._cond:
+            self._error = exc
+            self._cond.notify_all()
+        for event, slot in list(self._pending.values()):
+            slot["msg"] = exc
+            event.set()
+        try:
+            self._queue.put_nowait(_SESSION_FAILED)
+        except queue.Full:
+            pass
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
     def _process(self, msg):
         t = msg.get("t")
@@ -646,10 +728,6 @@ class AirdaqRemote:
             }
         elif t == "record":
             return self._decode_record(msg)
-        elif t == "beacon":
-            self.last_beacon = msg
-            if "unix" in msg:
-                self._anchor = (msg["ts"], msg["unix"])
         elif t == "ready":
             self.ready = True
         elif t == "reset":

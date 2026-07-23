@@ -1,10 +1,23 @@
 import socket
 import threading
+import time
 
 import cbor2
 import pytest
 
 from airel.spectcomm.airdaq import AirdaqError, AirdaqRemote, AirdaqStreamConnection
+
+S_HELLO = {
+    "t": "hello",
+    "protocol": "airdaq",
+    "version": 2,
+    "capabilities": [],
+    "device_id": "nais-7-32",
+    "make": "Airel",
+    "model": "NAIS-7",
+    "hw_version": "rev-C",
+    "fw_version": "1.4.2",
+}
 
 
 def send(sock, msg):
@@ -46,21 +59,7 @@ def fake_server(sock):
     c_hello = recv(sock)
     assert c_hello["t"] == "hello"
     assert c_hello["version"] == 2
-    send(
-        sock,
-        {
-            "t": "hello",
-            "protocol": "airdaq",
-            "version": 2,
-            "nonce": c_hello["nonce"],
-            "capabilities": [],
-            "device_id": "nais-7-32",
-            "make": "Airel",
-            "model": "NAIS-7",
-            "hw_version": "rev-C",
-            "fw_version": "1.4.2",
-        },
-    )
+    send(sock, S_HELLO | {"nonce": c_hello["nonce"]})
     send(
         sock,
         {
@@ -140,14 +139,16 @@ def test_session(dev):
     assert dev.settings == {"flow_target": 25.0, "flow_control": None}
     assert isinstance(dev.settings["flow_target"], float)
     assert dev.state == {"uptime_ns": 86400, "temperature": 32.5}
-    assert dev.control == {"t": "control", "has_control": False}
+    assert dev.control["has_control"] is False
     assert dev.channels == {"raw": {"kind": "record"}}
 
     dev.subscribe(["raw"])
     assert dev.subscriptions == {"raw"}
 
-    recs = dev.records()
-    snapshot = next(recs)
+    before = time.time_ns()
+    meta = dev.next_message(timeout=5)
+    assert meta["t"] == "record_meta"
+    snapshot = dev.next_message(timeout=5)
     assert snapshot["snapshot"] is True
     # ids mapped to keys, ints coerced to floats, unusable/unknown fields
     # kept raw under their wire ids
@@ -158,11 +159,14 @@ def test_session(dev):
         2: [9, 9],
         60: "extra",
     }
-    live = next(recs)
+    beacon = dev.next_message(timeout=5)
+    assert beacon["t"] == "beacon"
+    assert beacon["unix"] == 1_000_000_000
+    live = next(dev.records())
     assert live["ts"] == 2000
     assert live["values"] == {"em_voltage": 2.5}
-
-    assert dev.unix_ns(2000) == 1_000_000_000 + 500
+    for m in (meta, snapshot, beacon, live):
+        assert before <= m["rx_unix_ns"] <= time.time_ns()
 
     dev.set("flow_target", 30.0)
     dev.next_message(timeout=5)  # the settings delta push
@@ -174,3 +178,47 @@ def test_session(dev):
 
     assert dev.ping() == 86408
     assert dev.request_control(priority=5) is True
+
+
+def test_auto_ping():
+    got = []
+
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"], "idle_timeout": 0.2})
+        send(sock, {"t": "ready"})
+        got.append(recv(sock))  # the reader's keepalive, unprompted
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    with AirdaqRemote(AirdaqStreamConnection(client_sock), client_name="t@h"):
+        t.join(timeout=5)
+    assert got and got[0]["t"] == "ping"
+
+
+def test_queue_overflow():
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"]})
+        send(sock, {"t": "ready"})
+        for i in range(5):
+            send(sock, {"t": "log", "ts": i, "level": "info", "text": "spam"})
+        time.sleep(1)
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    with AirdaqRemote(
+        AirdaqStreamConnection(client_sock), client_name="t@h", queue_size=2
+    ) as dev:
+        time.sleep(0.3)  # let the reader hit the full queue
+        assert dev.next_message(timeout=1)["ts"] == 0
+        assert dev.next_message(timeout=1)["ts"] == 1
+        with pytest.raises(AirdaqError, match="queue full"):
+            dev.next_message(timeout=1)
+        with pytest.raises(AirdaqError, match="queue full"):
+            dev.ping()
+    t.join(timeout=5)

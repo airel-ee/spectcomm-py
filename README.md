@@ -20,9 +20,11 @@ for rec in dev.records():
     print(rec["ts"], rec["values"])
 ```
 
-Settings and state are mirrored in `dev.settings` / `dev.state` and kept
-current while messages are being received. Writes go through
+A background reader thread drains the connection: it keeps
+`dev.settings` / `dev.state` current, sends the idle-timeout keepalive,
+and feeds records, beacons, events, and logs — each stamped with the
+receive wall clock as `rx_unix_ns` — to `dev.next_message()` /
+`dev.records()`. Writes go through
 `dev.set(key, value)` / `dev.unset(key)`; device actions through
 `dev.command(key, params)`. On servers that arbitrate control, call
-`dev.request_control(priority)` first. `dev.unix_ns(ts)` maps device
-timestamps to Unix time once an anchored beacon has arrived.
+`dev.request_control(priority)` first.
