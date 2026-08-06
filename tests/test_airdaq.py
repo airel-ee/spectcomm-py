@@ -16,7 +16,7 @@ S_HELLO = {
     "make": "Airel",
     "model": "NAIS-7",
     "hw_version": "rev-C",
-    "fw_version": "1.4.2",
+    "sw_version": "1.4.2",
 }
 
 

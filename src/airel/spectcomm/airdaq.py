@@ -468,7 +468,10 @@ class AirdaqRemote:
         self.make = self.hello.get("make")
         self.model = self.hello.get("model")
         self.hw_version = self.hello.get("hw_version")
-        self.fw_version = self.hello.get("fw_version")
+        # The serving implementation (spec section 1). sw_name is absent when it
+        # is the model's stock software, so sw_version is scoped to the model.
+        self.sw_name = self.hello.get("sw_name")
+        self.sw_version = self.hello.get("sw_version")
         self._last_send = time.monotonic()
 
         self._reader = threading.Thread(
