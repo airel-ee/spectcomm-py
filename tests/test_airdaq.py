@@ -1,3 +1,4 @@
+import json
 import socket
 import threading
 import time
@@ -6,6 +7,7 @@ import cbor2
 import pytest
 
 from airel.spectcomm.airdaq import AirdaqError, AirdaqRemote, AirdaqStreamConnection
+from airel.spectcomm.airdaq_cli import _parse_params, main
 
 S_HELLO = {
     "t": "hello",
@@ -222,3 +224,41 @@ def test_queue_overflow():
         with pytest.raises(AirdaqError, match="queue full"):
             dev.ping()
     t.join(timeout=5)
+
+
+def test_cli_command(tmp_path, capsys):
+    sock_path = tmp_path / "airdaq.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(sock_path))
+    listener.listen(1)
+    got = []
+
+    def server():
+        sock, _ = listener.accept()
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"]})
+        send(sock, {"t": "ready"})
+        m = recv(sock)
+        got.append(m)
+        send(sock, {"t": "ok", "id": m["id"], "result": {"leds": [1, 0, 1]}})
+        while recv(sock) is not None:
+            pass
+        sock.close()
+        listener.close()
+
+    t = threading.Thread(target=server, daemon=True)
+    t.start()
+    rc = main(["--unix", str(sock_path), "cmd", "set_led", "[1,", "0,", "1]"])
+    t.join(timeout=5)
+
+    assert rc == 0
+    assert got == [
+        {"t": "command", "id": got[0]["id"], "key": "set_led", "params": [1, 0, 1]}
+    ]
+    assert json.loads(capsys.readouterr().out) == {"leds": [1, 0, 1]}
+
+
+def test_parse_params():
+    assert _parse_params(["[1,", "0,", "1]"]) == [1, 0, 1]
+    assert _parse_params(["auto"]) == "auto"
+    assert _parse_params([]) is None
