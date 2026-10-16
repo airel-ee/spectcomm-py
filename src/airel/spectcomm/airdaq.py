@@ -694,8 +694,10 @@ class AirdaqRemote:
         with self._cond:
             self._error = exc
             self._cond.notify_all()
+        # A request whose response already arrived stays pending until its
+        # caller wakes up and reads it.
         for event, slot in list(self._pending.values()):
-            slot["msg"] = exc
+            slot.setdefault("msg", exc)
             event.set()
         try:
             self._queue.put_nowait(_SESSION_FAILED)
