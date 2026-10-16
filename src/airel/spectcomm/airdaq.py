@@ -500,6 +500,10 @@ class AirdaqRemote:
             pass
         if self._reader is not None and self._reader.is_alive():
             self._reader.join(timeout=5)
+        # A closing reader exits without failing the session, so waiting
+        # requests and queue readers would otherwise sit out their timeouts.
+        if self._error is None:
+            self._fail(AirdaqError("session closed"))
 
     def wait_ready(self, timeout=10):
         with self._cond:

@@ -226,6 +226,46 @@ def test_queue_overflow():
     t.join(timeout=5)
 
 
+def test_close_releases_waiters():
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"]})
+        send(sock, {"t": "ready"})
+        recv(sock)  # a ping left unanswered
+        recv(sock)  # until the client closes
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    dev = AirdaqRemote(AirdaqStreamConnection(client_sock), client_name="t@h")
+    errors = {}
+
+    def wait(name, call):
+        try:
+            call()
+        except AirdaqError as e:
+            errors[name] = str(e)
+
+    waiters = [
+        threading.Thread(target=wait, args=("ping", lambda: dev.ping(timeout=30))),
+        threading.Thread(
+            target=wait, args=("queue", lambda: dev.next_message(timeout=30))
+        ),
+    ]
+    for w in waiters:
+        w.start()
+    time.sleep(0.2)
+    start = time.monotonic()
+    dev.close()
+    for w in waiters:
+        w.join(timeout=5)
+    assert time.monotonic() - start < 5
+    assert errors == {"ping": "session closed", "queue": "session closed"}
+    with pytest.raises(AirdaqError, match="session closed"):
+        dev.ping()
+    t.join(timeout=5)
+
+
 def test_cli_command(tmp_path, capsys):
     sock_path = tmp_path / "airdaq.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
