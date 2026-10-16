@@ -144,10 +144,10 @@ def test_session(dev):
     assert dev.control["has_control"] is False
     assert dev.channels == {"raw": {"kind": "record"}}
 
+    before = time.time_ns()
     dev.subscribe(["raw"])
     assert dev.subscriptions == {"raw"}
 
-    before = time.time_ns()
     meta = dev.next_message(timeout=5)
     assert meta["t"] == "record_meta"
     snapshot = dev.next_message(timeout=5)
