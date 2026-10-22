@@ -459,19 +459,23 @@ class AirdaqRemote:
                 "version": "0.1.0",
             },
         }
-        self.hello = self.conn.handshake(hello)
-        if self.hello.get("protocol") != "airdaq":
-            raise AirdaqError(
-                "unexpected protocol {!r}".format(self.hello.get("protocol"))
-            )
-        if self.hello.get("version") != PROTOCOL_VERSION:
-            raise AirdaqError(
-                "server speaks airdaq v{}, this client supports v{}".format(
-                    self.hello.get("version"), PROTOCOL_VERSION
+        try:
+            self.hello = self.conn.handshake(hello)
+            if self.hello.get("protocol") != "airdaq":
+                raise AirdaqError(
+                    "unexpected protocol {!r}".format(self.hello.get("protocol"))
                 )
-            )
-        if "nonce" in self.hello and self.hello["nonce"] != hello["nonce"]:
-            raise AirdaqError("server hello carries a foreign nonce")
+            if self.hello.get("version") != PROTOCOL_VERSION:
+                raise AirdaqError(
+                    "server speaks airdaq v{}, this client supports v{}".format(
+                        self.hello.get("version"), PROTOCOL_VERSION
+                    )
+                )
+            if "nonce" in self.hello and self.hello["nonce"] != hello["nonce"]:
+                raise AirdaqError("server hello carries a foreign nonce")
+        except BaseException:
+            self.conn.close()
+            raise
         self.conn.peer_max_message = self.hello.get("max_message", 8192)
         self.idle_timeout = self.hello.get("idle_timeout")
         self.device_id = self.hello.get("device_id")

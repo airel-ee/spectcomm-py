@@ -227,6 +227,22 @@ def test_keepalive_during_pending_command():
     t.join(timeout=5)
 
 
+def test_failed_handshake_closes_the_connection():
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"], "version": 3})
+        recv(sock)  # until the client closes
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    with pytest.raises(AirdaqError, match="v3"):
+        AirdaqRemote(AirdaqStreamConnection(client_sock), client_name="t@h")
+    t.join(timeout=5)
+    assert not t.is_alive()
+
+
 def test_queue_overflow():
     def server(sock):
         c_hello = recv(sock)
