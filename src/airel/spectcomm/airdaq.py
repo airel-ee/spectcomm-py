@@ -344,11 +344,13 @@ def connect_usb(device_id=None, client_name=None):
     for dev in usb.core.find(find_all=True, idVendor=USB_VID, idProduct=USB_PID):
         if not is_airdaq(dev):
             continue
+        # pyusb raises ValueError ("no langid") for string descriptors it may
+        # not read, as on a node udev has yet to grant access to.
         try:
             if dev.manufacturer != "Airel":
                 continue
             serial = dev.serial_number
-        except usb.core.USBError as e:
+        except (usb.core.USBError, ValueError) as e:
             raise AirdaqError(
                 "cannot read descriptors of USB device {:03d}:{:03d}: {} "
                 "(check udev permissions)".format(dev.bus, dev.address, e)
