@@ -188,6 +188,8 @@ class AirdaqUsbConnection:
                     return msg
 
     def send_message(self, message):
+        if self.ep_out is None:
+            raise AirdaqError("connection closed")
         data = cbor2.dumps(message)
         if len(data) > self.peer_max_message:
             raise AirdaqError(
@@ -198,6 +200,8 @@ class AirdaqUsbConnection:
         self.ep_out.write(cobs.encode(data) + b"\x00")
 
     def receive_message(self, timeout=60):
+        if self.ep_in is None:
+            raise AirdaqError("connection closed")
         frame = self._receive_frame(timeout)
         if frame is None:
             return None
@@ -238,6 +242,9 @@ class AirdaqUsbConnection:
         # release_interface raises on a disconnected device; dispose_resources
         # releases the claim regardless and closes the handle.
         usb.util.dispose_resources(self.device)
+        # pyusb re-opens a disposed device, and re-claims its interface, on
+        # its next transfer.
+        self.ep_in = self.ep_out = None
 
 
 def discover(timeout=0.5):
@@ -436,11 +443,9 @@ class AirdaqRemote:
         self._ping_ids = set()
         self._pending = {}
         self._error = None
-        self._closing = False
         self._cond = threading.Condition()
         self._send_lock = threading.Lock()
         self._control_gen = 0
-        self._reader = None
 
         if client_name is None:
             try:
@@ -507,14 +512,10 @@ class AirdaqRemote:
         self.close()
 
     def close(self):
-        self._closing = True
-        self._close_conn()
-        if self._reader is not None and self._reader.is_alive():
-            self._reader.join(timeout=5)
-        # A closing reader exits without failing the session, so waiting
-        # requests and queue readers would otherwise sit out their timeouts.
-        if self._error is None:
-            self._fail(AirdaqError("session closed"))
+        self._fail(AirdaqError("session closed"))
+        # The reader closes the connection on its way out: on USB a handle
+        # disposed under a transfer in flight is undefined in libusb.
+        self._reader.join()
 
     def wait_ready(self, timeout=10):
         with self._cond:
@@ -617,6 +618,8 @@ class AirdaqRemote:
 
     def _send(self, message):
         with self._send_lock:
+            if self._error is not None:
+                raise self._error
             self.conn.send_message(message)
             self._last_send = time.monotonic()
 
@@ -646,7 +649,7 @@ class AirdaqRemote:
 
     def _reader_loop(self):
         try:
-            while True:
+            while self._error is None:
                 self._maybe_ping()
                 tick = (
                     1.0
@@ -656,11 +659,15 @@ class AirdaqRemote:
                 msg = self.conn.receive_message(tick)
                 if msg is not None:
                     self._handle(msg)
-        except (AirdaqError, OSError) as e:
-            if not self._closing:
-                if not isinstance(e, AirdaqError):
-                    e = AirdaqError("connection lost: {}".format(e))
-                self._fail(e)
+        except AirdaqError as e:
+            self._fail(e)
+        except OSError as e:
+            self._fail(AirdaqError("connection lost: {}".format(e)))
+        except BaseException as e:
+            self._fail(AirdaqError("reader failed: {!r}".format(e)))
+            raise
+        finally:
+            self._close_conn()
 
     def _maybe_ping(self):
         # Client silence past idle_timeout invalidates the session (USB,
@@ -704,7 +711,10 @@ class AirdaqRemote:
             raise AirdaqError("message queue full -- consumer too slow")
 
     def _fail(self, exc):
+        """Ends the session with `exc`; the first failure stands."""
         with self._cond:
+            if self._error is not None:
+                return
             self._error = exc
             self._cond.notify_all()
         # A request whose response already arrived stays pending until its
@@ -716,16 +726,12 @@ class AirdaqRemote:
             self._queue.put_nowait(_SESSION_FAILED)
         except queue.Full:
             pass
-        self._close_conn()
 
     def _close_conn(self):
         # Never under a send in flight: on USB the interface release kills the
         # bulk OUT transfer mid-frame, which libusb reports as NO_DEVICE.
         with self._send_lock:
-            try:
-                self.conn.close()
-            except Exception:
-                pass
+            self.conn.close()
 
     def _process(self, msg):
         t = msg.get("t")
