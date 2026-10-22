@@ -23,6 +23,8 @@ from cobs import cobs
 PROTOCOL_VERSION = 2
 DISCOVERY_PORT = 55404
 MAX_MESSAGE = 1 << 20  # our inbound bound, advertised as max_message in c-hello
+# How long a begun inbound message may stall: TCP retransmission takes seconds.
+MESSAGE_GAP = 5.0
 
 # Shared V-USB vendor space: VID:PID alone is not identity; the interface
 # signature (class 0xFF, subclass 'A') and manufacturer string complete it.
@@ -62,6 +64,9 @@ class AirdaqStreamConnection:
         self._writable = selectors.DefaultSelector()
         self._writable.register(sock, selectors.EVENT_WRITE)
         self._closing = threading.Lock()
+        self._rx = bytearray()
+        # When the last bytes arrived: a begun message may stall MESSAGE_GAP.
+        self._rx_at = 0.0
 
     def handshake(self, hello):
         self.write(self.encode(hello), timeout=10)
@@ -99,41 +104,65 @@ class AirdaqStreamConnection:
                 continue
 
     def receive_message(self, timeout=60):
-        payload = bytearray()
+        """The next message, or None after `timeout`. A message still
+        arriving at the timeout stays buffered for the next call."""
+        deadline = time.monotonic() + timeout
         while True:
-            header = self._recv_exact(2, timeout, allow_none=not payload)
-            if header is None:
-                return None
-            h = int.from_bytes(header, "big")
-            size = h & 0x7FFF
-            if size == 0:
-                if not h & 0x8000:
-                    raise AirdaqError("zero-length terminating fragment")
-                continue  # keepalive
-            if len(payload) + size > MAX_MESSAGE:
-                raise AirdaqError("incoming message exceeds size limit")
-            payload += self._recv_exact(size, timeout)
-            if not h & 0x8000:
-                try:
-                    return cbor2.loads(bytes(payload))
-                except cbor2.CBORDecodeError as e:
-                    raise AirdaqError("invalid CBOR from server: {}".format(e))
-
-    def _recv_exact(self, n, timeout, allow_none=False):
-        buf = bytearray()
-        while len(buf) < n:
-            if not self._readable.select(timeout):
-                if allow_none and not buf:
+            msg = self._take_message()
+            if msg is not None:
+                return msg
+            now = time.monotonic()
+            wait = deadline - now
+            if self._rx:
+                wait = min(wait, self._rx_at + MESSAGE_GAP - now)
+            # Polled even past the gap: the rest may have arrived while no
+            # call was reading.
+            if not self._readable.select(max(wait, 0)):
+                now = time.monotonic()
+                if self._rx and now - self._rx_at >= MESSAGE_GAP:
+                    raise AirdaqError("timeout mid-message")
+                if now >= deadline:
                     return None
-                raise AirdaqError("timeout mid-message")
+                continue
             try:
-                chunk = self.socket.recv(n - len(buf))
+                chunk = self.socket.recv(65536)
             except BlockingIOError:
                 continue
             if not chunk:
                 raise AirdaqError("connection closed by server")
-            buf += chunk
-        return bytes(buf)
+            self._rx += chunk
+            self._rx_at = time.monotonic()
+
+    def _take_message(self):
+        """Removes the first whole message from the receive buffer and
+        returns it; None while none is whole."""
+        payload = bytearray()
+        pos = 0
+        while len(self._rx) - pos >= 2:
+            h = int.from_bytes(self._rx[pos : pos + 2], "big")
+            size = h & 0x7FFF
+            if size == 0:
+                if not h & 0x8000:
+                    raise AirdaqError("zero-length terminating fragment")
+                pos += 2
+                if not payload:
+                    # A keepalive between messages begins none.
+                    del self._rx[:pos]
+                    pos = 0
+                continue
+            if len(payload) + size > MAX_MESSAGE:
+                raise AirdaqError("incoming message exceeds size limit")
+            if len(self._rx) - pos - 2 < size:
+                return None
+            payload += self._rx[pos + 2 : pos + 2 + size]
+            pos += 2 + size
+            if not h & 0x8000:
+                del self._rx[:pos]
+                try:
+                    return cbor2.loads(bytes(payload))
+                except cbor2.CBORDecodeError as e:
+                    raise AirdaqError("invalid CBOR from server: {}".format(e))
+        return None
 
     def interrupt(self):
         """Wakes a send or receive waiting on the socket, which then fails."""

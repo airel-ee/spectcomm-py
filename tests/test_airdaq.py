@@ -6,6 +6,7 @@ import time
 import cbor2
 import pytest
 
+from airel.spectcomm import airdaq
 from airel.spectcomm.airdaq import AirdaqError, AirdaqRemote, AirdaqStreamConnection
 from airel.spectcomm.airdaq_cli import _parse_params, main
 
@@ -509,6 +510,87 @@ def test_a_message_the_client_cannot_send_leaves_the_session_standing():
             dev.command("odd", object(), timeout=5)
         assert dev.ping(timeout=5) == 86408
     t.join(timeout=5)
+
+
+def test_a_message_stalled_past_the_reader_tick_arrives():
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"]})
+        send(sock, {"t": "ready"})
+        data = cbor2.dumps({"t": "event", "channel": "log", "values": {"n": 1}})
+        sock.sendall(len(data).to_bytes(2, "big") + data[:5])
+        time.sleep(1.5)  # past the reader's 1 s tick, as a retransmission
+        sock.sendall(data[5:])
+        while recv(sock) is not None:
+            pass
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    with AirdaqRemote(AirdaqStreamConnection(client_sock), client_name="t@h") as dev:
+        msg = dev.next_message(timeout=5)
+        assert msg["values"] == {"n": 1}
+    t.join(timeout=5)
+
+
+def test_a_stalled_message_holds_up_no_keepalive():
+    got = []
+
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"], "idle_timeout": 1.0})
+        send(sock, {"t": "ready"})
+        data = cbor2.dumps({"t": "event", "channel": "log", "values": {"n": 1}})
+        sock.sendall(len(data).to_bytes(2, "big") + data[:5])
+        sock.settimeout(3)
+        got.append(recv(sock))  # owed within idle_timeout/2 of the hello
+        sock.sendall(data[5:])
+        sock.settimeout(None)
+        while recv(sock) is not None:
+            pass
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    with AirdaqRemote(AirdaqStreamConnection(client_sock), client_name="t@h") as dev:
+        assert dev.next_message(timeout=5)["values"] == {"n": 1}
+    t.join(timeout=5)
+    assert got[0]["t"] == "ping"
+
+
+def message_split():
+    data = cbor2.dumps({"t": "event", "channel": "log", "values": {"n": 1}})
+    frame = len(data).to_bytes(2, "big") + data
+    return frame[:5], frame[5:]
+
+
+def test_a_message_read_late_is_no_stall(monkeypatch):
+    """The rest of a begun message arriving while no call reads it is taken,
+    however long the reading waits."""
+    monkeypatch.setattr(airdaq, "MESSAGE_GAP", 0.2)
+    client_sock, server_sock = socket.socketpair()
+    conn = AirdaqStreamConnection(client_sock)
+    head, rest = message_split()
+    server_sock.sendall(head)
+    assert conn.receive_message(timeout=0.05) is None
+    server_sock.sendall(rest)
+    time.sleep(0.3)
+    assert conn.receive_message(timeout=1)["values"] == {"n": 1}
+    conn.close()
+    server_sock.close()
+
+
+def test_a_message_stalled_past_the_gap_fails(monkeypatch):
+    monkeypatch.setattr(airdaq, "MESSAGE_GAP", 0.2)
+    client_sock, server_sock = socket.socketpair()
+    conn = AirdaqStreamConnection(client_sock)
+    server_sock.sendall(message_split()[0])
+    with pytest.raises(AirdaqError, match="timeout mid-message"):
+        conn.receive_message(timeout=5)
+    conn.close()
+    server_sock.close()
 
 
 def test_cli_command(tmp_path, capsys):
