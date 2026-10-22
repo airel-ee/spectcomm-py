@@ -567,6 +567,11 @@ class AirdaqRemote:
         # disposed under a transfer in flight is undefined in libusb.
         self._reader.join()
 
+    @property
+    def error(self):
+        """The AirdaqError that ended the session; None while it stands."""
+        return self._error
+
     def wait_ready(self, timeout=10):
         with self._cond:
             self._cond.wait_for(

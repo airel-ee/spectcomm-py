@@ -345,6 +345,34 @@ def test_session_failure_leaves_a_send_in_flight_whole():
     assert cbor2.loads(wire[2:])["key"] == "fw_install_write"
 
 
+def test_a_request_timeout_leaves_the_session_standing():
+    timed_out = threading.Event()
+
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"]})
+        send(sock, {"t": "ready"})
+        recv(sock)  # left unanswered
+        timed_out.wait(timeout=5)
+        send(sock, {"t": "reset", "reason": "idle_timeout"})
+        while recv(sock) is not None:
+            pass
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    with AirdaqRemote(AirdaqStreamConnection(client_sock), client_name="t@h") as dev:
+        with pytest.raises(AirdaqError, match="timeout waiting for response"):
+            dev.command("slow", timeout=0.2)
+        assert dev.error is None
+        timed_out.set()
+        with pytest.raises(AirdaqError, match="reset by server"):
+            dev.next_message(timeout=5)
+        assert str(dev.error) == "session reset by server: idle_timeout"
+    t.join(timeout=5)
+
+
 def recv_whole(sock):
     """The next message, across its fragments."""
     payload = bytearray()
