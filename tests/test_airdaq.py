@@ -317,11 +317,11 @@ def test_session_failure_leaves_a_send_in_flight_whole():
     wire = bytearray()
 
     class SlowSend(AirdaqStreamConnection):
-        def send_message(self, message, timeout):
-            if message["t"] == "command":
+        def write(self, frame, timeout):
+            if b"fw_install_write" in frame:
                 sending.set()
                 time.sleep(0.3)
-            super().send_message(message, timeout)
+            super().write(frame, timeout)
 
     def server(sock):
         c_hello = recv(sock)
@@ -414,7 +414,73 @@ def test_close_frees_a_send_the_peer_never_reads():
     done.set()
     assert not closer.is_alive()
     assert not sender.is_alive()
-    assert errors
+    assert isinstance(errors[0], AirdaqError)
+
+
+def test_a_send_the_peer_never_reads_ends_the_session():
+    done = threading.Event()
+
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"], "max_message": 1 << 24})
+        send(sock, {"t": "ready"})
+        done.wait(timeout=10)
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    dev = AirdaqRemote(AirdaqStreamConnection(client_sock), client_name="t@h")
+    outcome = []
+
+    def call():
+        start = time.monotonic()
+        try:
+            dev.command("big", BIG, timeout=1)
+        except AirdaqError as e:
+            outcome.append((time.monotonic() - start, e))
+        # Another frame would land in the middle of the clipped one.
+        try:
+            dev.ping(timeout=1)
+        except AirdaqError as e:
+            outcome.append(e)
+
+    caller = threading.Thread(target=call, daemon=True)
+    caller.start()
+    caller.join(timeout=5)
+    done.set()
+    assert not caller.is_alive()
+    (elapsed, failed), later = outcome
+    assert elapsed < 2
+    assert str(failed) == "send failed: send timed out after 1 s"
+    assert later is failed
+    closer = threading.Thread(target=dev.close, daemon=True)
+    closer.start()
+    closer.join(timeout=5)
+    assert not closer.is_alive()
+
+
+def test_a_message_the_client_cannot_send_leaves_the_session_standing():
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"], "max_message": 1024})
+        send(sock, {"t": "ready"})
+        m = recv(sock)
+        send(sock, {"t": "ok", "id": m["id"], "result": 86408})
+        while recv(sock) is not None:
+            pass
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    with AirdaqRemote(AirdaqStreamConnection(client_sock), client_name="t@h") as dev:
+        with pytest.raises(AirdaqError, match="exceeds peer limit of 1024"):
+            dev.command("big", bytes(2000), timeout=5)
+        with pytest.raises(cbor2.CBOREncodeError):
+            dev.command("odd", object(), timeout=5)
+        assert dev.ping(timeout=5) == 86408
+    t.join(timeout=5)
 
 
 def test_cli_command(tmp_path, capsys):

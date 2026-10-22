@@ -64,13 +64,14 @@ class AirdaqStreamConnection:
         self._closing = threading.Lock()
 
     def handshake(self, hello):
-        self.send_message(hello, timeout=10)
+        self.write(self.encode(hello), timeout=10)
         s_hello = self.receive_message(timeout=10)
         if s_hello is None:
             raise AirdaqError("no hello from server")
         return s_hello
 
-    def send_message(self, message, timeout):
+    def encode(self, message):
+        """The frame carrying `message`."""
         data = cbor2.dumps(message)
         if len(data) > self.peer_max_message:
             raise AirdaqError(
@@ -83,6 +84,9 @@ class AirdaqStreamConnection:
             frag = data[pos : pos + 0x7FFF]
             more = 0x8000 if pos + len(frag) < len(data) else 0
             frame += (len(frag) | more).to_bytes(2, "big") + frag
+        return bytes(frame)
+
+    def write(self, frame, timeout):
         deadline = time.monotonic() + timeout
         view = memoryview(frame)
         while view:
@@ -220,9 +224,8 @@ class AirdaqUsbConnection:
                 if msg.get("nonce") == hello["nonce"]:
                     return msg
 
-    def send_message(self, message, timeout):
-        if self.ep_out is None:
-            raise AirdaqError("connection closed")
+    def encode(self, message):
+        """The frame carrying `message`."""
         data = cbor2.dumps(message)
         if len(data) > self.peer_max_message:
             raise AirdaqError(
@@ -230,7 +233,12 @@ class AirdaqUsbConnection:
                     len(data), self.peer_max_message
                 )
             )
-        self.ep_out.write(cobs.encode(data) + b"\x00", int(timeout * 1000) + 1)
+        return cobs.encode(data) + b"\x00"
+
+    def write(self, frame, timeout):
+        if self.ep_out is None:
+            raise AirdaqError("connection closed")
+        self.ep_out.write(frame, int(timeout * 1000) + 1)
 
     def receive_message(self, timeout=60):
         if self.ep_in is None:
@@ -654,10 +662,25 @@ class AirdaqRemote:
                 yield msg
 
     def _send(self, message, timeout):
+        # Refusing to encode a message leaves the session as it was.
+        frame = self.conn.encode(message)
         with self._send_lock:
             if self._error is not None:
                 raise self._error
-            self.conn.send_message(message, timeout)
+            # A write cut short leaves a partial frame on the wire.
+            try:
+                self.conn.write(frame, timeout)
+            except OSError as e:
+                error = AirdaqError("send failed: {}".format(e))
+                self._fail(error)
+                raise error from e
+            except BaseException as e:
+                self._fail(
+                    e
+                    if isinstance(e, AirdaqError)
+                    else AirdaqError("send interrupted: {!r}".format(e))
+                )
+                raise
             self._last_send = time.monotonic()
 
     def _request(self, msg, timeout=60):
