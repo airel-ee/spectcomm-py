@@ -30,9 +30,16 @@ USB_SUBCLASS = 0x41
 
 
 class AirdaqError(Exception):
-    def __init__(self, message, code=None):
+    """A failed request or session.
+
+    For an `err` response, `code` is its code and `error` the whole `error`
+    map, structured fields included (spec section 10); both are None otherwise.
+    """
+
+    def __init__(self, message, code=None, error=None):
         super().__init__(message)
         self.code = code
+        self.error = error
 
 
 class AirdaqStreamConnection:
@@ -627,7 +634,9 @@ class AirdaqRemote:
         if m["t"] == "err":
             e = m.get("error", {})
             raise AirdaqError(
-                "{}: {}".format(e.get("code"), e.get("message")), code=e.get("code")
+                "{}: {}".format(e.get("code"), e.get("message")),
+                code=e.get("code"),
+                error=e,
             )
         return m.get("result")
 

@@ -107,7 +107,11 @@ def fake_server(sock):
         {
             "t": "err",
             "id": m["id"],
-            "error": {"code": "invalid_params", "message": "exceeds max 100"},
+            "error": {
+                "code": "invalid_params",
+                "message": "exceeds max 100",
+                "max": 100,
+            },
         },
     )
 
@@ -177,6 +181,7 @@ def test_session(dev):
     with pytest.raises(AirdaqError) as e:
         dev.set("flow_target", 999.0)
     assert e.value.code == "invalid_params"
+    assert e.value.error["max"] == 100
 
     assert dev.ping() == 86408
     assert dev.request_control(priority=5) is True
