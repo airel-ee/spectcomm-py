@@ -314,7 +314,7 @@ def test_session_failure_leaves_a_send_in_flight_whole():
     # OUT transfer mid-frame: the device is left a clipped frame and the
     # sender sees ENODEV.
     sending = threading.Event()
-    sends = []
+    wire = bytearray()
 
     class SlowSend(AirdaqStreamConnection):
         def send_message(self, message):
@@ -322,11 +322,6 @@ def test_session_failure_leaves_a_send_in_flight_whole():
                 sending.set()
                 time.sleep(0.3)
             super().send_message(message)
-            sends.append(message["t"])
-
-        def close(self):
-            sends.append("close")
-            super().close()
 
     def server(sock):
         c_hello = recv(sock)
@@ -334,8 +329,8 @@ def test_session_failure_leaves_a_send_in_flight_whole():
         send(sock, {"t": "ready"})
         sending.wait(timeout=5)
         send(sock, {"t": "reset", "reason": "idle_timeout"})
-        while recv(sock) is not None:
-            pass
+        while chunk := sock.recv(65536):
+            wire.extend(chunk)
         sock.close()
 
     client_sock, server_sock = socket.socketpair()
@@ -345,7 +340,9 @@ def test_session_failure_leaves_a_send_in_flight_whole():
         with pytest.raises(AirdaqError, match="reset by server"):
             dev.command("fw_install_write", timeout=5)
     t.join(timeout=5)
-    assert sends[1:3] == ["command", "close"]
+    size = int.from_bytes(wire[:2], "big")
+    assert len(wire) == 2 + size
+    assert cbor2.loads(wire[2:])["key"] == "fw_install_write"
 
 
 def test_cli_command(tmp_path, capsys):
