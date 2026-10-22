@@ -646,18 +646,29 @@ class AirdaqRemote:
 
     def request_control(self, priority=0, timeout=60):
         """Queue a control request; return has_control from the control push
-        that follows every request_control."""
+        that follows every request_control (spec section 4): the first
+        received after sending it that grants control or names the holder,
+        which servers send before or after the ok."""
+        deadline = time.monotonic() + timeout
         with self._cond:
             gen = self._control_gen
         self._request(
             {"t": "request_control", "id": next(self._ids), "priority": priority},
             timeout,
         )
+        # A push reporting no holder was sent before the request was queued:
+        # once queued, the session holds control or waits behind a holder.
+        def answered():
+            return self._control_gen > gen and (
+                self.control["has_control"] or "controlling_host" in self.control
+            )
+
         with self._cond:
             self._cond.wait_for(
-                lambda: self._control_gen > gen or self._error is not None, timeout
+                lambda: answered() or self._error is not None,
+                deadline - time.monotonic(),
             )
-            if self._control_gen <= gen:
+            if not answered():
                 raise self._error or AirdaqError(
                     "no control push after request_control"
                 )

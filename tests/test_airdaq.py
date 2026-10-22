@@ -560,6 +560,51 @@ def test_a_stalled_message_holds_up_no_keepalive():
     assert got[0]["t"] == "ping"
 
 
+def test_request_control_takes_a_push_sent_before_its_ok():
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"]})
+        send(sock, {"t": "control", "has_control": False, "controlling_name": "a@h"})
+        send(sock, {"t": "ready"})
+        m = recv(sock)
+        send(sock, {"t": "control", "has_control": True})
+        send(sock, {"t": "ok", "id": m["id"], "result": None})
+        while recv(sock) is not None:
+            pass
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    with AirdaqRemote(AirdaqStreamConnection(client_sock), client_name="t@h") as dev:
+        assert dev.request_control(timeout=2) is True
+    t.join(timeout=5)
+
+
+def test_request_control_skips_a_release_sent_before_it():
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"]})
+        send(sock, {"t": "control", "has_control": False, "controlling_host": "10.0.0.5:4000"})
+        send(sock, {"t": "ready"})
+        m = recv(sock)
+        # The holder's release, crossing the request on the wire.
+        send(sock, {"t": "control", "has_control": False})
+        send(sock, {"t": "ok", "id": m["id"], "result": None})
+        time.sleep(0.3)
+        send(sock, {"t": "control", "has_control": True})
+        while recv(sock) is not None:
+            pass
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    with AirdaqRemote(AirdaqStreamConnection(client_sock), client_name="t@h") as dev:
+        assert dev.request_control(timeout=2) is True
+    t.join(timeout=5)
+
+
 def message_split():
     data = cbor2.dumps({"t": "event", "channel": "log", "values": {"n": 1}})
     frame = len(data).to_bytes(2, "big") + data
