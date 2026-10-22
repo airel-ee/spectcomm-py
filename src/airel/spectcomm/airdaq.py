@@ -7,10 +7,12 @@ the first key -- a protocol encoder obligation.
 """
 
 import getpass
+import errno
 import ipaddress
 import itertools
 import queue
 import random
+import selectors
 import socket
 import threading
 import time
@@ -52,15 +54,23 @@ class AirdaqStreamConnection:
     def __init__(self, sock):
         self.socket = sock
         self.peer_max_message = 8192
+        # One socket timeout bounds both directions; each waits on its own
+        # deadline instead.
+        sock.setblocking(False)
+        self._readable = selectors.DefaultSelector()
+        self._readable.register(sock, selectors.EVENT_READ)
+        self._writable = selectors.DefaultSelector()
+        self._writable.register(sock, selectors.EVENT_WRITE)
+        self._closing = threading.Lock()
 
     def handshake(self, hello):
-        self.send_message(hello)
+        self.send_message(hello, timeout=10)
         s_hello = self.receive_message(timeout=10)
         if s_hello is None:
             raise AirdaqError("no hello from server")
         return s_hello
 
-    def send_message(self, message):
+    def send_message(self, message, timeout):
         data = cbor2.dumps(message)
         if len(data) > self.peer_max_message:
             raise AirdaqError(
@@ -68,14 +78,21 @@ class AirdaqStreamConnection:
                     len(data), self.peer_max_message
                 )
             )
-        pos = 0
-        while True:
+        frame = bytearray()
+        for pos in range(0, len(data), 0x7FFF):
             frag = data[pos : pos + 0x7FFF]
-            pos += len(frag)
-            header = len(frag) | (0 if pos >= len(data) else 0x8000)
-            self.socket.sendall(header.to_bytes(2, "big") + frag)
-            if pos >= len(data):
-                return
+            more = 0x8000 if pos + len(frag) < len(data) else 0
+            frame += (len(frag) | more).to_bytes(2, "big") + frag
+        deadline = time.monotonic() + timeout
+        view = memoryview(frame)
+        while view:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self._writable.select(remaining):
+                raise TimeoutError("send timed out after {:g} s".format(timeout))
+            try:
+                view = view[self.socket.send(view) :]
+            except BlockingIOError:
+                continue
 
     def receive_message(self, timeout=60):
         payload = bytearray()
@@ -99,22 +116,38 @@ class AirdaqStreamConnection:
                     raise AirdaqError("invalid CBOR from server: {}".format(e))
 
     def _recv_exact(self, n, timeout, allow_none=False):
-        self.socket.settimeout(timeout)
         buf = bytearray()
         while len(buf) < n:
-            try:
-                chunk = self.socket.recv(n - len(buf))
-            except TimeoutError:
+            if not self._readable.select(timeout):
                 if allow_none and not buf:
                     return None
                 raise AirdaqError("timeout mid-message")
+            try:
+                chunk = self.socket.recv(n - len(buf))
+            except BlockingIOError:
+                continue
             if not chunk:
                 raise AirdaqError("connection closed by server")
             buf += chunk
         return bytes(buf)
 
+    def interrupt(self):
+        """Wakes a send or receive waiting on the socket, which then fails."""
+        with self._closing:
+            if self.socket.fileno() == -1:
+                return
+            try:
+                self.socket.shutdown(socket.SHUT_RDWR)
+            except OSError as e:
+                # The peer already ended the connection: nothing waits on it.
+                if e.errno != errno.ENOTCONN:
+                    raise
+
     def close(self):
-        self.socket.close()
+        with self._closing:
+            self._readable.close()
+            self._writable.close()
+            self.socket.close()
 
 
 class AirdaqUsbConnection:
@@ -187,7 +220,7 @@ class AirdaqUsbConnection:
                 if msg.get("nonce") == hello["nonce"]:
                     return msg
 
-    def send_message(self, message):
+    def send_message(self, message, timeout):
         if self.ep_out is None:
             raise AirdaqError("connection closed")
         data = cbor2.dumps(message)
@@ -197,7 +230,7 @@ class AirdaqUsbConnection:
                     len(data), self.peer_max_message
                 )
             )
-        self.ep_out.write(cobs.encode(data) + b"\x00")
+        self.ep_out.write(cobs.encode(data) + b"\x00", int(timeout * 1000) + 1)
 
     def receive_message(self, timeout=60):
         if self.ep_in is None:
@@ -235,6 +268,10 @@ class AirdaqUsbConnection:
             except usb.core.USBTimeoutError:
                 return None
             self.buf += bytes(chunk)
+
+    def interrupt(self):
+        """Nothing: closing the handle under a bulk transfer is undefined in
+        libusb, and the transfer's timeout bounds it."""
 
     def close(self):
         import usb.util
@@ -329,7 +366,6 @@ def connect(address=None, port=None, socket_path=None, device_id=None, client_na
                 )
             address, port = usable[0]["address"], usable[0]["port"]
         sock = socket.create_connection((address, port), timeout=3)
-        sock.settimeout(None)
     return AirdaqRemote(AirdaqStreamConnection(sock), client_name=client_name)
 
 
@@ -513,6 +549,7 @@ class AirdaqRemote:
 
     def close(self):
         self._fail(AirdaqError("session closed"))
+        self.conn.interrupt()
         # The reader closes the connection on its way out: on USB a handle
         # disposed under a transfer in flight is undefined in libusb.
         self._reader.join()
@@ -616,11 +653,11 @@ class AirdaqRemote:
             if msg.get("t") == "record" and channel in (None, msg.get("channel")):
                 yield msg
 
-    def _send(self, message):
+    def _send(self, message, timeout):
         with self._send_lock:
             if self._error is not None:
                 raise self._error
-            self.conn.send_message(message)
+            self.conn.send_message(message, timeout)
             self._last_send = time.monotonic()
 
     def _request(self, msg, timeout=60):
@@ -629,9 +666,10 @@ class AirdaqRemote:
         event = threading.Event()
         slot = {}
         self._pending[msg["id"]] = (event, slot)
+        deadline = time.monotonic() + timeout
         try:
-            self._send(msg)
-            if not event.wait(timeout):
+            self._send(msg, timeout)
+            if not event.wait(deadline - time.monotonic()):
                 raise AirdaqError("timeout waiting for response")
         finally:
             self._pending.pop(msg["id"], None)
@@ -678,7 +716,7 @@ class AirdaqRemote:
         ):
             msgid = next(self._ids)
             self._ping_ids.add(msgid)
-            self._send({"t": "ping", "id": msgid})
+            self._send({"t": "ping", "id": msgid}, self.idle_timeout / 2)
 
     def _handle(self, msg):
         t = msg.get("t")

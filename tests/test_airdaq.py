@@ -317,11 +317,11 @@ def test_session_failure_leaves_a_send_in_flight_whole():
     wire = bytearray()
 
     class SlowSend(AirdaqStreamConnection):
-        def send_message(self, message):
+        def send_message(self, message, timeout):
             if message["t"] == "command":
                 sending.set()
                 time.sleep(0.3)
-            super().send_message(message)
+            super().send_message(message, timeout)
 
     def server(sock):
         c_hello = recv(sock)
@@ -343,6 +343,78 @@ def test_session_failure_leaves_a_send_in_flight_whole():
     size = int.from_bytes(wire[:2], "big")
     assert len(wire) == 2 + size
     assert cbor2.loads(wire[2:])["key"] == "fw_install_write"
+
+
+def recv_whole(sock):
+    """The next message, across its fragments."""
+    payload = bytearray()
+    while True:
+        header = int.from_bytes(sock.recv(2, socket.MSG_WAITALL), "big")
+        payload += sock.recv(header & 0x7FFF, socket.MSG_WAITALL)
+        if not header & 0x8000:
+            return cbor2.loads(bytes(payload))
+
+
+BIG = bytes(4 << 20)  # past the socket buffers
+
+
+def test_a_send_outlasting_the_reader_tick_arrives_whole():
+    got = []
+
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"], "max_message": 1 << 24})
+        send(sock, {"t": "ready"})
+        time.sleep(1.5)  # past the reader's 1 s tick, not reading
+        m = recv_whole(sock)
+        got.append(m)
+        send(sock, {"t": "ok", "id": m["id"], "result": None})
+        while recv(sock) is not None:
+            pass
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    with AirdaqRemote(AirdaqStreamConnection(client_sock), client_name="t@h") as dev:
+        assert dev.command("big", BIG, timeout=10) is None
+    t.join(timeout=5)
+    assert got[0]["params"] == BIG
+
+
+def test_close_frees_a_send_the_peer_never_reads():
+    done = threading.Event()
+
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"], "max_message": 1 << 24})
+        send(sock, {"t": "ready"})
+        done.wait(timeout=10)
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    dev = AirdaqRemote(AirdaqStreamConnection(client_sock), client_name="t@h")
+    errors = []
+
+    def call():
+        try:
+            dev.command("big", BIG, timeout=60)
+        except Exception as e:
+            errors.append(e)
+
+    sender = threading.Thread(target=call, daemon=True)
+    sender.start()
+    time.sleep(0.5)
+    closer = threading.Thread(target=dev.close, daemon=True)
+    closer.start()
+    closer.join(timeout=5)
+    sender.join(timeout=5)
+    done.set()
+    assert not closer.is_alive()
+    assert not sender.is_alive()
+    assert errors
 
 
 def test_cli_command(tmp_path, capsys):
