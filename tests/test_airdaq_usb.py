@@ -202,3 +202,14 @@ def test_no_send_follows_a_session_failure():
     assert lib.commands == ["slow"]
     assert errors["queued"] == "session reset by server: idle_timeout"
     assert not lib.handles
+
+
+def test_a_failed_claim_closes_the_handle():
+    lib = FakeLibusb()
+    holder = AirdaqUsbConnection(usb.core.Device("airdaq", lib))
+    device = usb.core.Device("airdaq", lib)
+    with pytest.raises(usb.core.USBError, match="Resource busy"):
+        AirdaqUsbConnection(device)
+
+    assert len(lib.handles) == 1
+    holder.close()

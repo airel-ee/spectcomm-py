@@ -169,39 +169,44 @@ class AirdaqUsbConnection:
         self.peer_max_message = 8192
         self.buf = bytearray()
 
+        # The first descriptor read opens the handle.
         try:
-            cfg = device.get_active_configuration()
-        except usb.core.USBError:
-            device.set_configuration()
-            cfg = device.get_active_configuration()
+            try:
+                cfg = device.get_active_configuration()
+            except usb.core.USBError:
+                device.set_configuration()
+                cfg = device.get_active_configuration()
 
-        self.intf = usb.util.find_descriptor(
-            cfg,
-            custom_match=lambda i: i.bInterfaceClass == 0xFF
-            and i.bInterfaceSubClass == USB_SUBCLASS,
-        )
-        if self.intf is None:
-            raise AirdaqError("device has no airdaq interface")
-        if self.intf.bInterfaceProtocol != PROTOCOL_VERSION:
-            raise AirdaqError(
-                "device speaks airdaq major {}, this client supports {}".format(
-                    self.intf.bInterfaceProtocol, PROTOCOL_VERSION
-                )
+            self.intf = usb.util.find_descriptor(
+                cfg,
+                custom_match=lambda i: i.bInterfaceClass == 0xFF
+                and i.bInterfaceSubClass == USB_SUBCLASS,
             )
+            if self.intf is None:
+                raise AirdaqError("device has no airdaq interface")
+            if self.intf.bInterfaceProtocol != PROTOCOL_VERSION:
+                raise AirdaqError(
+                    "device speaks airdaq major {}, this client supports {}".format(
+                        self.intf.bInterfaceProtocol, PROTOCOL_VERSION
+                    )
+                )
 
-        usb.util.claim_interface(device, self.intf)
-        self.ep_out = usb.util.find_descriptor(
-            self.intf,
-            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
-            == usb.util.ENDPOINT_OUT,
-        )
-        self.ep_in = usb.util.find_descriptor(
-            self.intf,
-            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
-            == usb.util.ENDPOINT_IN,
-        )
-        if self.ep_out is None or self.ep_in is None:
-            raise AirdaqError("airdaq interface lacks bulk endpoints")
+            usb.util.claim_interface(device, self.intf)
+            self.ep_out = usb.util.find_descriptor(
+                self.intf,
+                custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
+                == usb.util.ENDPOINT_OUT,
+            )
+            self.ep_in = usb.util.find_descriptor(
+                self.intf,
+                custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
+                == usb.util.ENDPOINT_IN,
+            )
+            if self.ep_out is None or self.ep_in is None:
+                raise AirdaqError("airdaq interface lacks bulk endpoints")
+        except BaseException:
+            usb.util.dispose_resources(device)
+            raise
 
     def handshake(self, hello):
         # c-hello doubles as the connect / session-reset signal; the leading
