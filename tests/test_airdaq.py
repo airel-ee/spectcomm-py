@@ -205,6 +205,28 @@ def test_auto_ping():
     assert got and got[0]["t"] == "ping"
 
 
+def test_keepalive_during_pending_command():
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"], "idle_timeout": 0.2})
+        send(sock, {"t": "ready"})
+        command = recv(sock)
+        ping = recv(sock)  # sent while the command is unanswered
+        assert ping["t"] == "ping"
+        send(sock, {"t": "ok", "id": ping["id"], "result": 0})
+        send(sock, {"t": "ok", "id": command["id"], "result": {"align": 32}})
+        while recv(sock) is not None:
+            pass
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    with AirdaqRemote(AirdaqStreamConnection(client_sock), client_name="t@h") as dev:
+        assert dev.command("slow", timeout=5) == {"align": 32}
+    t.join(timeout=5)
+
+
 def test_queue_overflow():
     def server(sock):
         c_hello = recv(sock)
