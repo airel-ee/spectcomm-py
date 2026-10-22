@@ -309,6 +309,45 @@ def test_close_releases_waiters():
     t.join(timeout=5)
 
 
+def test_session_failure_leaves_a_send_in_flight_whole():
+    # On USB, closing the transport releases the interface, which kills a bulk
+    # OUT transfer mid-frame: the device is left a clipped frame and the
+    # sender sees ENODEV.
+    sending = threading.Event()
+    sends = []
+
+    class SlowSend(AirdaqStreamConnection):
+        def send_message(self, message):
+            if message["t"] == "command":
+                sending.set()
+                time.sleep(0.3)
+            super().send_message(message)
+            sends.append(message["t"])
+
+        def close(self):
+            sends.append("close")
+            super().close()
+
+    def server(sock):
+        c_hello = recv(sock)
+        send(sock, S_HELLO | {"nonce": c_hello["nonce"]})
+        send(sock, {"t": "ready"})
+        sending.wait(timeout=5)
+        send(sock, {"t": "reset", "reason": "idle_timeout"})
+        while recv(sock) is not None:
+            pass
+        sock.close()
+
+    client_sock, server_sock = socket.socketpair()
+    t = threading.Thread(target=server, args=(server_sock,), daemon=True)
+    t.start()
+    with AirdaqRemote(SlowSend(client_sock), client_name="t@h") as dev:
+        with pytest.raises(AirdaqError, match="reset by server"):
+            dev.command("fw_install_write", timeout=5)
+    t.join(timeout=5)
+    assert sends[1:3] == ["command", "close"]
+
+
 def test_cli_command(tmp_path, capsys):
     sock_path = tmp_path / "airdaq.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

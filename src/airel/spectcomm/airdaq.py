@@ -508,10 +508,7 @@ class AirdaqRemote:
 
     def close(self):
         self._closing = True
-        try:
-            self.conn.close()
-        except Exception:
-            pass
+        self._close_conn()
         if self._reader is not None and self._reader.is_alive():
             self._reader.join(timeout=5)
         # A closing reader exits without failing the session, so waiting
@@ -719,10 +716,16 @@ class AirdaqRemote:
             self._queue.put_nowait(_SESSION_FAILED)
         except queue.Full:
             pass
-        try:
-            self.conn.close()
-        except Exception:
-            pass
+        self._close_conn()
+
+    def _close_conn(self):
+        # Never under a send in flight: on USB the interface release kills the
+        # bulk OUT transfer mid-frame, which libusb reports as NO_DEVICE.
+        with self._send_lock:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
 
     def _process(self, msg):
         t = msg.get("t")
