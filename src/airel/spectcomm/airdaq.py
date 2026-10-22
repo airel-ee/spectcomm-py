@@ -235,7 +235,8 @@ class AirdaqUsbConnection:
     def close(self):
         import usb.util
 
-        usb.util.release_interface(self.device, self.intf)
+        # release_interface raises on a disconnected device; dispose_resources
+        # releases the claim regardless and closes the handle.
         usb.util.dispose_resources(self.device)
 
 
